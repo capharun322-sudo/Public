@@ -13,7 +13,7 @@ jobs:
           M=https://repo1.maven.org/maven2/org/microemu
           curl -fsSL -o libs/cldc.jar $M/cldcapi11/2.0.4/cldcapi11-2.0.4.jar
           curl -fsSL -o libs/midp.jar $M/midpapi20/2.0.4/midpapi20-2.0.4.jar
-          curl -fsSL -L -o pg.zip https://github.com/Guardsquare/proguard/releases/download/v7.5.0/proguard-7.5.0.zip
+          curl -fsSL -L -o pg.zip https://github.com/Guardsquare/proguard/releases/download/v7.4.2/proguard-7.4.2.zip
           unzip -q pg.zip
       - name: Compile (old Java level, CLDC libs)
         run: |
@@ -25,7 +25,7 @@ jobs:
           printf 'MIDlet-1: PyPhone,,PyEdit\nMIDlet-Name: PyPhone\nMIDlet-Vendor: PyPhone\nMIDlet-Version: 1.0.0\nMicroEdition-Configuration: CLDC-1.0\nMicroEdition-Profile: MIDP-2.0\n' > manifest.txt
           jar cfm app.jar manifest.txt -C classes .
           printf -- '-injars app.jar\n-outjars dist/PyPhone.jar\n-libraryjars libs/cldc.jar\n-libraryjars libs/midp.jar\n-microedition\n-dontshrink\n-dontoptimize\n-dontobfuscate\n-dontnote\n-dontwarn\n-keep public class PyEdit\n' > pg.pro
-          java -jar proguard-7.5.0/lib/proguard.jar @pg.pro
+          java -jar proguard-7.4.2/lib/proguard.jar @pg.pro
           jar ufm dist/PyPhone.jar manifest.txt
           SIZE=$(wc -c < dist/PyPhone.jar | tr -d ' ')
           { cat manifest.txt; echo "MIDlet-Jar-URL: PyPhone.jar"; echo "MIDlet-Jar-Size: $SIZE"; } > dist/PyPhone.jad
