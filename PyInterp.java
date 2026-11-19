@@ -3,10 +3,9 @@ import java.util.Vector;
 
 /**
  * Tiny Python-subset interpreter for CLDC 1.0 / MIDP 2.0 phones.
- * Supports: ints, strings, f-strings, True/False/None, variables,
- * + - * // / % ** and/or/not, comparisons, in, indexing, string methods,
- * print/input/int/str/len/abs/min/max, if/elif/else, while, for..range,
- * for over a string, break, continue, pass.
+ * ints, strings, f-strings, lists, True/False/None, def/return/global,
+ * if/elif/else, while, for (range, list, string), break, continue, pass,
+ * indexing and slicing, string/list methods.
  * No generics / StringBuilder / other post-CLDC APIs are used on purpose.
  */
 public class PyInterp {
@@ -15,6 +14,8 @@ public class PyInterp {
     static final Boolean T = new Boolean(true);
     static final Boolean F = new Boolean(false);
     static final int MAX_STR = 20000;
+    static final int MAX_LIST = 10000;
+    static final int MAX_DEPTH = 40;
 
     static class Tok {
         int type;
@@ -37,14 +38,29 @@ public class PyInterp {
         }
     }
 
+    static class PyList {
+        Vector v = new Vector();
+    }
+
+    static class PyFunc {
+        String name;
+        String[] params;
+        int body;
+        int bind;
+    }
+
     private PyIO io;
     public volatile boolean stopped = false;
 
     private Vector lines = new Vector();
     private int[] indent;
     private int[] lineNo;
-    private Hashtable vars = new Hashtable();
-    private int flow = 0; // 1 = break, 2 = continue
+    private Hashtable globals = new Hashtable();
+    private Hashtable locals = null;
+    private Hashtable gdecl = null;
+    private int depth = 0;
+    private Object retVal = NONE;
+    private int flow = 0; // 1 = break, 2 = continue, 3 = return
     private int cur = 0; // current source line (for messages)
 
     // expression parser state
@@ -116,7 +132,7 @@ public class PyInterp {
         }
         execBlock(0, 0);
         if (flow != 0) {
-            throw err("SyntaxError: 'break' or 'continue' outside loop");
+            throw err("SyntaxError: 'break', 'continue' or 'return' outside its block");
         }
     }
 
@@ -244,6 +260,26 @@ public class PyInterp {
         return j + 1;
     }
 
+    // ------------------------------------------------------------ variables
+
+    private Object lookupVar(String n) {
+        if (locals != null) {
+            Object v = locals.get(n);
+            if (v != null) {
+                return v;
+            }
+        }
+        return globals.get(n);
+    }
+
+    private void storeVar(String n, Object v) {
+        if (locals != null && (gdecl == null || !gdecl.containsKey(n))) {
+            locals.put(n, v);
+        } else {
+            globals.put(n, v);
+        }
+    }
+
     // ------------------------------------------------------------ statements
 
     private int blockEnd(int i, int ind) {
@@ -276,7 +312,7 @@ public class PyInterp {
         }
     }
 
-    /** Runs a loop body once. Returns true if the loop must stop (break). */
+    /** Runs a loop body once. Returns true if the loop must stop. */
     private boolean loopBody(int i, int bi, int e) throws PyError {
         runBlock(i, bi, e);
         if (flow == 1) {
@@ -285,8 +321,9 @@ public class PyInterp {
         }
         if (flow == 2) {
             flow = 0;
+            return false;
         }
-        return false;
+        return flow == 3;
     }
 
     private int execBlock(int i, int ind) throws PyError {
@@ -311,11 +348,32 @@ public class PyInterp {
                 i = execWhile(i, ind);
             } else if (kw.equals("for")) {
                 i = execFor(i, ind);
+            } else if (kw.equals("def")) {
+                i = execDef(i, ind);
             } else if (kw.equals("break")) {
                 flow = 1;
                 i++;
             } else if (kw.equals("continue")) {
                 flow = 2;
+                i++;
+            } else if (kw.equals("return")) {
+                if (locals == null) {
+                    throw err("SyntaxError: 'return' outside function");
+                }
+                retVal = t.length == 1 ? NONE : eval(t, 1, t.length);
+                flow = 3;
+                i++;
+            } else if (kw.equals("global")) {
+                if (locals != null) {
+                    if (gdecl == null) {
+                        gdecl = new Hashtable();
+                    }
+                    for (int k = 1; k < t.length; k++) {
+                        if (t[k].type == NAME) {
+                            gdecl.put(t[k].s, T);
+                        }
+                    }
+                }
                 i++;
             } else if (kw.equals("pass")) {
                 i++;
@@ -402,45 +460,123 @@ public class PyInterp {
         int bi = bodyIndent(i, ind);
         int e = blockEnd(i, ind);
         String var = t[1].s;
-        if (t[3].isName("range") && t[4].isOp("(")) {
+        if (t[3].isName("range") && t[4].isOp("(") && t[t.length - 2].isOp(")")) {
             Vector a = evalArgs(t, 4, t.length - 1);
-            int c = a.size();
-            if (c < 1 || c > 3) {
-                throw err("TypeError: range expected 1 to 3 arguments");
-            }
-            long start = 0, stop, step = 1;
-            if (c == 1) {
-                stop = num(a.elementAt(0));
-            } else {
-                start = num(a.elementAt(0));
-                stop = num(a.elementAt(1));
-                if (c == 3) {
-                    step = num(a.elementAt(2));
-                }
-            }
-            if (step == 0) {
-                throw err("ValueError: range() arg 3 must not be zero");
-            }
+            long[] r = rangeArgs(a);
+            long start = r[0], stop = r[1], step = r[2];
             for (long k = start; step > 0 ? k < stop : k > stop; k += step) {
-                vars.put(var, new Long(k));
+                storeVar(var, new Long(k));
                 if (loopBody(i, bi, e)) {
                     break;
                 }
             }
         } else {
             Object o = eval(t, 3, t.length - 1);
-            if (!(o instanceof String)) {
-                throw err("TypeError: object is not iterable (use range() or a string)");
-            }
-            String s = (String) o;
-            for (int k = 0; k < s.length(); k++) {
-                vars.put(var, s.substring(k, k + 1));
-                if (loopBody(i, bi, e)) {
-                    break;
+            if (o instanceof PyList) {
+                PyList L = (PyList) o;
+                for (int k = 0; k < L.v.size(); k++) {
+                    storeVar(var, L.v.elementAt(k));
+                    if (loopBody(i, bi, e)) {
+                        break;
+                    }
                 }
+            } else if (o instanceof String) {
+                String s = (String) o;
+                for (int k = 0; k < s.length(); k++) {
+                    storeVar(var, s.substring(k, k + 1));
+                    if (loopBody(i, bi, e)) {
+                        break;
+                    }
+                }
+            } else {
+                throw err("TypeError: object is not iterable (use range(), a list or a string)");
             }
         }
         return e;
+    }
+
+    private long[] rangeArgs(Vector a) throws PyError {
+        int c = a.size();
+        if (c < 1 || c > 3) {
+            throw err("TypeError: range expected 1 to 3 arguments");
+        }
+        long start = 0, stop, step = 1;
+        if (c == 1) {
+            stop = num(a.elementAt(0));
+        } else {
+            start = num(a.elementAt(0));
+            stop = num(a.elementAt(1));
+            if (c == 3) {
+                step = num(a.elementAt(2));
+            }
+        }
+        if (step == 0) {
+            throw err("ValueError: range() arg 3 must not be zero");
+        }
+        return new long[] {start, stop, step};
+    }
+
+    private int execDef(int i, int ind) throws PyError {
+        Tok[] t = (Tok[]) lines.elementAt(i);
+        needColon(t);
+        if (t.length < 5 || t[1].type != NAME || !t[2].isOp("(") || !t[t.length - 2].isOp(")")) {
+            throw syntax();
+        }
+        Vector ps = new Vector();
+        for (int k = 3; k < t.length - 2; k++) {
+            if (k % 2 == 1) {
+                if (t[k].type != NAME) {
+                    throw syntax();
+                }
+                ps.addElement(t[k].s);
+            } else if (!t[k].isOp(",")) {
+                throw syntax();
+            }
+        }
+        PyFunc f = new PyFunc();
+        f.name = t[1].s;
+        f.params = new String[ps.size()];
+        ps.copyInto(f.params);
+        f.bind = bodyIndent(i, ind);
+        f.body = i + 1;
+        storeVar(f.name, f);
+        return blockEnd(i, ind);
+    }
+
+    private Object invoke(PyFunc f, Vector args) throws PyError {
+        if (args.size() != f.params.length) {
+            throw err("TypeError: " + f.name + "() takes " + f.params.length
+                    + " arguments but " + args.size() + " were given");
+        }
+        if (depth >= MAX_DEPTH) {
+            throw err("RecursionError: too many nested calls (limit " + MAX_DEPTH + ")");
+        }
+        Hashtable savedLocals = locals;
+        Hashtable savedG = gdecl;
+        int savedCur = cur;
+        Hashtable nl = new Hashtable();
+        for (int i = 0; i < f.params.length; i++) {
+            nl.put(f.params[i], args.elementAt(i));
+        }
+        locals = nl;
+        gdecl = null;
+        depth++;
+        Object ret = NONE;
+        try {
+            execBlock(f.body, f.bind);
+            if (flow == 3) {
+                ret = retVal;
+            } else if (flow != 0) {
+                throw err("SyntaxError: 'break' or 'continue' outside loop");
+            }
+            flow = 0;
+        } finally {
+            locals = savedLocals;
+            gdecl = savedG;
+            depth--;
+            cur = savedCur;
+        }
+        return ret;
     }
 
     private void execSimple(Tok[] t) throws PyError {
@@ -448,17 +584,51 @@ public class PyInterp {
             String op = t[1].s;
             String name = t[0].s;
             if (op.equals("=")) {
-                vars.put(name, eval(t, 2, t.length));
+                storeVar(name, eval(t, 2, t.length));
                 return;
             }
             if (isIn("+=|-=|*=|//=|%=", op)) {
-                Object old = vars.get(name);
+                Object old = lookupVar(name);
                 if (old == null) {
                     throw err("NameError: name '" + name + "' is not defined");
                 }
                 Object r = eval(t, 2, t.length);
-                vars.put(name, binop(op.substring(0, op.length() - 1), old, r));
+                storeVar(name, binop(op.substring(0, op.length() - 1), old, r));
                 return;
+            }
+            if (op.equals("[")) {
+                int j = 2, d = 1;
+                while (j < t.length && d > 0) {
+                    if (t[j].isOp("[")) {
+                        d++;
+                    } else if (t[j].isOp("]")) {
+                        d--;
+                    }
+                    j++;
+                }
+                // j is index just after the matching ']'
+                if (d == 0 && j < t.length && t[j].type == OP
+                        && (t[j].s.equals("=") || isIn("+=|-=|*=|//=|%=", t[j].s))) {
+                    Object target = lookupVar(name);
+                    if (!(target instanceof PyList)) {
+                        throw err("TypeError: only lists support item assignment");
+                    }
+                    PyList L = (PyList) target;
+                    long k = num(eval(t, 2, j - 1));
+                    if (k < 0) {
+                        k += L.v.size();
+                    }
+                    if (k < 0 || k >= L.v.size()) {
+                        throw err("IndexError: list assignment index out of range");
+                    }
+                    Object val = eval(t, j + 1, t.length);
+                    if (!t[j].s.equals("=")) {
+                        val = binop(t[j].s.substring(0, t[j].s.length() - 1),
+                                L.v.elementAt((int) k), val);
+                    }
+                    L.v.setElementAt(val, (int) k);
+                    return;
+                }
             }
         }
         eval(t, 0, t.length);
@@ -615,12 +785,12 @@ public class PyInterp {
         if (p < end && tk[p].isOp("-")) {
             p++;
             Object v = parseUnary();
-            return skip > 0 ? null : new Long(-num(v));
+            return skip > 0 ? null : (Object) new Long(-num(v));
         }
         if (p < end && tk[p].isOp("+")) {
             p++;
             Object v = parseUnary();
-            return skip > 0 ? null : new Long(num(v));
+            return skip > 0 ? null : (Object) new Long(num(v));
         }
         return parsePower();
     }
@@ -640,9 +810,26 @@ public class PyInterp {
         while (p < end) {
             if (tk[p].isOp("[")) {
                 p++;
-                Object ix = parseOr();
+                Object a = null, b = null;
+                boolean slice = false;
+                if (!(p < end && tk[p].isOp(":"))) {
+                    a = parseOr();
+                }
+                if (p < end && tk[p].isOp(":")) {
+                    slice = true;
+                    p++;
+                    if (!(p < end && tk[p].isOp("]"))) {
+                        b = parseOr();
+                    }
+                }
                 expectOp("]");
-                l = skip > 0 ? null : index(l, ix);
+                if (skip > 0) {
+                    l = null;
+                } else if (slice) {
+                    l = slice(l, a, b);
+                } else {
+                    l = index(l, a);
+                }
             } else if (tk[p].isOp(".")) {
                 p++;
                 if (p >= end || tk[p].type != NAME) {
@@ -698,12 +885,22 @@ public class PyInterp {
             if (p < end && tk[p].isOp("(")) {
                 Vector a = parseArgs();
                 Hashtable kw = lastKw;
-                return skip > 0 ? null : call(s, a, kw);
+                if (skip > 0) {
+                    return null;
+                }
+                Object f = lookupVar(s);
+                if (f instanceof PyFunc) {
+                    return invoke((PyFunc) f, a);
+                }
+                if (f != null) {
+                    throw err("TypeError: '" + s + "' is not a function");
+                }
+                return call(s, a, kw);
             }
             if (skip > 0) {
                 return null;
             }
-            Object v = vars.get(s);
+            Object v = lookupVar(s);
             if (v == null) {
                 throw err("NameError: name '" + s + "' is not defined");
             }
@@ -713,6 +910,36 @@ public class PyInterp {
             Object v = parseOr();
             expectOp(")");
             return v;
+        }
+        if (t.isOp("[")) {
+            PyList L = new PyList();
+            if (p < end && tk[p].isOp("]")) {
+                p++;
+            } else {
+                while (true) {
+                    Object v = parseOr();
+                    if (skip == 0) {
+                        L.v.addElement(v);
+                    }
+                    if (p >= end) {
+                        throw syntax();
+                    }
+                    if (tk[p].isOp(",")) {
+                        p++;
+                        if (p < end && tk[p].isOp("]")) {
+                            p++;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (tk[p].isOp("]")) {
+                        p++;
+                        break;
+                    }
+                    throw syntax();
+                }
+            }
+            return skip > 0 ? null : (Object) L;
         }
         throw syntax();
     }
@@ -805,6 +1032,9 @@ public class PyInterp {
         if (o instanceof String) {
             return ((String) o).length() > 0;
         }
+        if (o instanceof PyList) {
+            return ((PyList) o).v.size() > 0;
+        }
         return o != NONE;
     }
 
@@ -817,6 +1047,25 @@ public class PyInterp {
         }
         if (o == NONE) {
             return "None";
+        }
+        if (o instanceof PyList) {
+            StringBuffer sb = new StringBuffer("[");
+            Vector v = ((PyList) o).v;
+            for (int i = 0; i < v.size(); i++) {
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                Object e = v.elementAt(i);
+                if (e instanceof String) {
+                    sb.append('\'').append((String) e).append('\'');
+                } else {
+                    sb.append(str(e));
+                }
+            }
+            return sb.append(']').toString();
+        }
+        if (o instanceof PyFunc) {
+            return "<function " + ((PyFunc) o).name + ">";
         }
         return o.toString();
     }
@@ -841,44 +1090,83 @@ public class PyInterp {
         if (o instanceof Boolean) {
             return "bool";
         }
+        if (o instanceof PyList) {
+            return "list";
+        }
+        if (o instanceof PyFunc) {
+            return "function";
+        }
         return "NoneType";
+    }
+
+    private static Object norm(Object o) {
+        if (o instanceof Boolean) {
+            return new Long(((Boolean) o).booleanValue() ? 1 : 0);
+        }
+        return o;
+    }
+
+    private boolean eq(Object a, Object b) {
+        a = norm(a);
+        b = norm(b);
+        if (a instanceof Long && b instanceof Long) {
+            return ((Long) a).longValue() == ((Long) b).longValue();
+        }
+        if (a instanceof String && b instanceof String) {
+            return a.equals(b);
+        }
+        if (a instanceof PyList && b instanceof PyList) {
+            Vector x = ((PyList) a).v, y = ((PyList) b).v;
+            if (x.size() != y.size()) {
+                return false;
+            }
+            for (int i = 0; i < x.size(); i++) {
+                if (!eq(x.elementAt(i), y.elementAt(i))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return a == b;
+    }
+
+    private int cmp(Object a, Object b, String op) throws PyError {
+        a = norm(a);
+        b = norm(b);
+        if (a instanceof Long && b instanceof Long) {
+            long x = ((Long) a).longValue(), y = ((Long) b).longValue();
+            return x < y ? -1 : (x > y ? 1 : 0);
+        }
+        if (a instanceof String && b instanceof String) {
+            return ((String) a).compareTo((String) b);
+        }
+        throw err("TypeError: '" + op + "' not supported between " + typeName(a)
+                + " and " + typeName(b));
     }
 
     private Object compare(String op, Object a, Object b) throws PyError {
         if (op.equals("in") || op.equals("not in")) {
-            if (!(a instanceof String) || !(b instanceof String)) {
-                throw err("TypeError: 'in' needs two strings");
+            boolean r;
+            if (b instanceof String && a instanceof String) {
+                r = ((String) b).indexOf((String) a) >= 0;
+            } else if (b instanceof PyList) {
+                r = false;
+                Vector v = ((PyList) b).v;
+                for (int i = 0; i < v.size() && !r; i++) {
+                    r = eq(a, v.elementAt(i));
+                }
+            } else {
+                throw err("TypeError: 'in' needs a string or a list on the right");
             }
-            boolean r = ((String) b).indexOf((String) a) >= 0;
             return (op.equals("in") == r) ? T : F;
         }
-        if (a instanceof Boolean) {
-            a = new Long(num(a));
-        }
-        if (b instanceof Boolean) {
-            b = new Long(num(b));
-        }
-        int c;
-        boolean comparable = true;
-        if (a instanceof Long && b instanceof Long) {
-            long x = ((Long) a).longValue(), y = ((Long) b).longValue();
-            c = x < y ? -1 : (x > y ? 1 : 0);
-        } else if (a instanceof String && b instanceof String) {
-            c = ((String) a).compareTo((String) b);
-        } else {
-            comparable = false;
-            c = 0;
-        }
         if (op.equals("==")) {
-            return (comparable && c == 0) ? T : F;
+            return eq(a, b) ? T : F;
         }
         if (op.equals("!=")) {
-            return (comparable && c == 0) ? F : T;
+            return eq(a, b) ? F : T;
         }
-        if (!comparable) {
-            throw err("TypeError: '" + op + "' not supported between " + typeName(a)
-                    + " and " + typeName(b));
-        }
+        int c = cmp(a, b, op);
         boolean r;
         if (op.equals("<")) {
             r = c < 0;
@@ -893,12 +1181,8 @@ public class PyInterp {
     }
 
     private Object binop(String op, Object a, Object b) throws PyError {
-        if (a instanceof Boolean) {
-            a = new Long(num(a));
-        }
-        if (b instanceof Boolean) {
-            b = new Long(num(b));
-        }
+        a = norm(a);
+        b = norm(b);
         if (a instanceof Long && b instanceof Long) {
             long x = ((Long) a).longValue(), y = ((Long) b).longValue();
             if (op.equals("+")) {
@@ -948,18 +1232,46 @@ public class PyInterp {
             }
             return r;
         }
-        if (op.equals("*") && (a instanceof String && b instanceof Long
-                || a instanceof Long && b instanceof String)) {
-            String s = a instanceof String ? (String) a : (String) b;
+        if (op.equals("+") && a instanceof PyList && b instanceof PyList) {
+            PyList r = new PyList();
+            Vector x = ((PyList) a).v, y = ((PyList) b).v;
+            if (x.size() + y.size() > MAX_LIST) {
+                throw err("MemoryError: list too long");
+            }
+            for (int i = 0; i < x.size(); i++) {
+                r.v.addElement(x.elementAt(i));
+            }
+            for (int i = 0; i < y.size(); i++) {
+                r.v.addElement(y.elementAt(i));
+            }
+            return r;
+        }
+        if (op.equals("*") && (a instanceof String || a instanceof PyList) && b instanceof Long
+                || op.equals("*") && a instanceof Long && (b instanceof String || b instanceof PyList)) {
+            Object seq = a instanceof Long ? b : a;
             long k = a instanceof Long ? ((Long) a).longValue() : ((Long) b).longValue();
-            if (k * s.length() > MAX_STR) {
-                throw err("MemoryError: string too long");
+            if (seq instanceof String) {
+                String s = (String) seq;
+                if (k * s.length() > MAX_STR) {
+                    throw err("MemoryError: string too long");
+                }
+                StringBuffer sb = new StringBuffer();
+                for (long i = 0; i < k; i++) {
+                    sb.append(s);
+                }
+                return sb.toString();
             }
-            StringBuffer sb = new StringBuffer();
+            Vector x = ((PyList) seq).v;
+            if (k * x.size() > MAX_LIST) {
+                throw err("MemoryError: list too long");
+            }
+            PyList r = new PyList();
             for (long i = 0; i < k; i++) {
-                sb.append(s);
+                for (int j = 0; j < x.size(); j++) {
+                    r.v.addElement(x.elementAt(j));
+                }
             }
-            return sb.toString();
+            return r;
         }
         if (op.equals("+") && (a instanceof String || b instanceof String)) {
             throw err("TypeError: can only concatenate str with str (use str(x) or an f-string)");
@@ -969,18 +1281,65 @@ public class PyInterp {
     }
 
     private Object index(Object l, Object ix) throws PyError {
-        if (!(l instanceof String)) {
-            throw err("TypeError: only strings can be indexed");
-        }
-        String s = (String) l;
         long k = num(ix);
-        if (k < 0) {
-            k += s.length();
+        if (l instanceof String) {
+            String s = (String) l;
+            if (k < 0) {
+                k += s.length();
+            }
+            if (k < 0 || k >= s.length()) {
+                throw err("IndexError: string index out of range");
+            }
+            return s.substring((int) k, (int) k + 1);
         }
-        if (k < 0 || k >= s.length()) {
-            throw err("IndexError: string index out of range");
+        if (l instanceof PyList) {
+            Vector v = ((PyList) l).v;
+            if (k < 0) {
+                k += v.size();
+            }
+            if (k < 0 || k >= v.size()) {
+                throw err("IndexError: list index out of range");
+            }
+            return v.elementAt((int) k);
         }
-        return s.substring((int) k, (int) k + 1);
+        throw err("TypeError: only strings and lists can be indexed");
+    }
+
+    private Object slice(Object l, Object a, Object b) throws PyError {
+        int n;
+        if (l instanceof String) {
+            n = ((String) l).length();
+        } else if (l instanceof PyList) {
+            n = ((PyList) l).v.size();
+        } else {
+            throw err("TypeError: only strings and lists can be sliced");
+        }
+        long s = a == null ? 0 : num(a);
+        long e = b == null ? n : num(b);
+        if (s < 0) {
+            s += n;
+        }
+        if (e < 0) {
+            e += n;
+        }
+        if (s < 0) {
+            s = 0;
+        }
+        if (e > n) {
+            e = n;
+        }
+        if (s > e) {
+            s = e;
+        }
+        if (l instanceof String) {
+            return ((String) l).substring((int) s, (int) e);
+        }
+        PyList r = new PyList();
+        Vector v = ((PyList) l).v;
+        for (int i = (int) s; i < e; i++) {
+            r.v.addElement(v.elementAt(i));
+        }
+        return r;
     }
 
     // ------------------------------------------------------------ builtins
@@ -1055,7 +1414,13 @@ public class PyInterp {
             }
             return new Long(num(o));
         }
+        if (name.equals("bool")) {
+            return c == 0 || !truthy(a.elementAt(0)) ? F : T;
+        }
         if (name.equals("len")) {
+            if (c == 1 && a.elementAt(0) instanceof PyList) {
+                return new Long(((PyList) a.elementAt(0)).v.size());
+            }
             return new Long(strArg(a, 0, "len").length());
         }
         if (name.equals("abs")) {
@@ -1065,26 +1430,84 @@ public class PyInterp {
             long x = num(a.elementAt(0));
             return new Long(x < 0 ? -x : x);
         }
-        if (name.equals("min") || name.equals("max")) {
-            if (c < 2) {
-                throw err("TypeError: " + name + "() needs at least 2 arguments");
+        if (name.equals("min") || name.equals("max") || name.equals("sum")) {
+            Vector items = a;
+            if (c == 1 && a.elementAt(0) instanceof PyList) {
+                items = ((PyList) a.elementAt(0)).v;
             }
-            long best = num(a.elementAt(0));
-            for (int i = 1; i < c; i++) {
-                long x = num(a.elementAt(i));
-                if (name.equals("min") ? x < best : x > best) {
-                    best = x;
+            int n = items.size();
+            if (name.equals("sum")) {
+                long s = 0;
+                for (int i = 0; i < n; i++) {
+                    s += num(items.elementAt(i));
+                }
+                return new Long(s);
+            }
+            if (n == 0 || (n == 1 && !(a.elementAt(0) instanceof PyList))) {
+                throw err("TypeError: " + name + "() needs a list or at least 2 values");
+            }
+            Object best = items.elementAt(0);
+            for (int i = 1; i < n; i++) {
+                int k = cmp(items.elementAt(i), best, name);
+                if (name.equals("min") ? k < 0 : k > 0) {
+                    best = items.elementAt(i);
                 }
             }
-            return new Long(best);
+            return best;
         }
         if (name.equals("range")) {
-            throw err("TypeError: range() only works in a 'for' line, e.g. for i in range(5):");
+            long[] r = rangeArgs(a);
+            PyList L = new PyList();
+            long start = r[0], stop = r[1], step = r[2];
+            for (long k = start; step > 0 ? k < stop : k > stop; k += step) {
+                if (L.v.size() >= MAX_LIST) {
+                    throw err("MemoryError: range too long");
+                }
+                L.v.addElement(new Long(k));
+            }
+            return L;
+        }
+        if (name.equals("list")) {
+            PyList L = new PyList();
+            if (c == 1 && a.elementAt(0) instanceof PyList) {
+                Vector x = ((PyList) a.elementAt(0)).v;
+                for (int i = 0; i < x.size(); i++) {
+                    L.v.addElement(x.elementAt(i));
+                }
+            } else if (c == 1 && a.elementAt(0) instanceof String) {
+                String s = (String) a.elementAt(0);
+                for (int i = 0; i < s.length(); i++) {
+                    L.v.addElement(s.substring(i, i + 1));
+                }
+            } else if (c != 0) {
+                throw err("TypeError: list() needs a list or a string");
+            }
+            return L;
+        }
+        if (name.equals("chr")) {
+            if (c != 1) {
+                throw err("TypeError: chr() takes 1 argument");
+            }
+            long k = num(a.elementAt(0));
+            if (k < 0 || k > 65535) {
+                throw err("ValueError: chr() arg not in range(65536)");
+            }
+            return String.valueOf((char) k);
+        }
+        if (name.equals("ord")) {
+            String s = strArg(a, 0, "ord");
+            if (s.length() != 1) {
+                throw err("TypeError: ord() needs a single character");
+            }
+            return new Long(s.charAt(0));
         }
         throw err("NameError: name '" + name + "' is not defined");
     }
 
     private Object method(Object l, String m, Vector a) throws PyError {
+        if (l instanceof PyList) {
+            return listMethod((PyList) l, m, a);
+        }
         if (!(l instanceof String)) {
             throw err("AttributeError: " + typeName(l) + " has no method '" + m + "'");
         }
@@ -1106,6 +1529,23 @@ public class PyInterp {
         }
         if (m.equals("find")) {
             return new Long(s.indexOf(strArg(a, 0, m)));
+        }
+        if (m.equals("count")) {
+            String o = strArg(a, 0, m);
+            if (o.length() == 0) {
+                return new Long(s.length() + 1);
+            }
+            long cnt = 0;
+            int i = 0;
+            while (true) {
+                int j = s.indexOf(o, i);
+                if (j < 0) {
+                    break;
+                }
+                cnt++;
+                i = j + o.length();
+            }
+            return new Long(cnt);
         }
         if (m.equals("isdigit")) {
             boolean ok = s.length() > 0;
@@ -1135,6 +1575,140 @@ public class PyInterp {
             }
             return sb.toString();
         }
+        if (m.equals("split")) {
+            PyList L = new PyList();
+            if (a.size() == 0) {
+                int i = 0, n = s.length();
+                while (i < n) {
+                    while (i < n && s.charAt(i) <= ' ') {
+                        i++;
+                    }
+                    int j = i;
+                    while (j < n && s.charAt(j) > ' ') {
+                        j++;
+                    }
+                    if (j > i) {
+                        L.v.addElement(s.substring(i, j));
+                    }
+                    i = j;
+                }
+                return L;
+            }
+            String sep = strArg(a, 0, m);
+            if (sep.length() == 0) {
+                throw err("ValueError: empty separator");
+            }
+            int i = 0;
+            while (true) {
+                int j = s.indexOf(sep, i);
+                if (j < 0) {
+                    L.v.addElement(s.substring(i));
+                    break;
+                }
+                L.v.addElement(s.substring(i, j));
+                i = j + sep.length();
+            }
+            return L;
+        }
+        if (m.equals("join")) {
+            if (a.size() != 1 || !(a.elementAt(0) instanceof PyList)) {
+                throw err("TypeError: join() needs a list of strings");
+            }
+            Vector v = ((PyList) a.elementAt(0)).v;
+            StringBuffer sb = new StringBuffer();
+            for (int i = 0; i < v.size(); i++) {
+                if (!(v.elementAt(i) instanceof String)) {
+                    throw err("TypeError: join() needs a list of strings");
+                }
+                if (i > 0) {
+                    sb.append(s);
+                }
+                sb.append((String) v.elementAt(i));
+            }
+            return sb.toString();
+        }
         throw err("AttributeError: str has no method '" + m + "'");
+    }
+
+    private Object listMethod(PyList L, String m, Vector a) throws PyError {
+        Vector v = L.v;
+        if (m.equals("append")) {
+            if (a.size() != 1) {
+                throw err("TypeError: append() takes 1 argument");
+            }
+            if (v.size() >= MAX_LIST) {
+                throw err("MemoryError: list too long");
+            }
+            v.addElement(a.elementAt(0));
+            return NONE;
+        }
+        if (m.equals("pop")) {
+            if (v.size() == 0) {
+                throw err("IndexError: pop from empty list");
+            }
+            long k = a.size() == 0 ? v.size() - 1 : num(a.elementAt(0));
+            if (k < 0) {
+                k += v.size();
+            }
+            if (k < 0 || k >= v.size()) {
+                throw err("IndexError: pop index out of range");
+            }
+            Object r = v.elementAt((int) k);
+            v.removeElementAt((int) k);
+            return r;
+        }
+        if (m.equals("insert")) {
+            if (a.size() != 2) {
+                throw err("TypeError: insert() takes 2 arguments");
+            }
+            long k = num(a.elementAt(0));
+            if (k < 0) {
+                k += v.size();
+            }
+            if (k < 0) {
+                k = 0;
+            }
+            if (k > v.size()) {
+                k = v.size();
+            }
+            v.insertElementAt(a.elementAt(1), (int) k);
+            return NONE;
+        }
+        if (m.equals("remove") || m.equals("index")) {
+            if (a.size() != 1) {
+                throw err("TypeError: " + m + "() takes 1 argument");
+            }
+            for (int i = 0; i < v.size(); i++) {
+                if (eq(v.elementAt(i), a.elementAt(0))) {
+                    if (m.equals("remove")) {
+                        v.removeElementAt(i);
+                        return NONE;
+                    }
+                    return new Long(i);
+                }
+            }
+            throw err("ValueError: value is not in list");
+        }
+        if (m.equals("reverse")) {
+            for (int i = 0, j = v.size() - 1; i < j; i++, j--) {
+                Object t = v.elementAt(i);
+                v.setElementAt(v.elementAt(j), i);
+                v.setElementAt(t, j);
+            }
+            return NONE;
+        }
+        if (m.equals("sort")) {
+            for (int i = 1; i < v.size(); i++) {
+                Object x = v.elementAt(i);
+                int j = i - 1;
+                while (j >= 0 && cmp(v.elementAt(j), x, "<") > 0) {
+                    v.setElementAt(v.elementAt(j), j + 1);
+                    j--;
+                }
+                v.setElementAt(x, j + 1);
+            }
+            return NONE;
+        }
+        throw err("AttributeError: list has no method '" + m + "'");
     }
 }
